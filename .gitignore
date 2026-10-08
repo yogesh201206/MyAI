@@ -1,0 +1,70 @@
+# AIZEN AI — .gitignore
+# =====================
+# Generated and runtime files that should not be committed to version control.
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Graphify knowledge graph output (generated, large)
+graphify-out/
+
+# User data (private — never commit)
+~/.myai/
+
+# Local data files (relative to project — never commit)
+data/*.json
+data/*.db
+data/*.index
+data/*.sqlite
+data/*.sqlite3
+
+# AIZEN user runtime data
+*.db
+provider_health.json
+chats.json
+config.json
+config.json.backup
+chats.json.backup
+prompt_history.txt
+
+# Temporary audio files (Phase 13 voice)
+tmp/
+*.wav
+*.mp3
+
+# OmniRoute log/pid
+omniroute.log
+omniroute.pid
+
+# Legacy/backup files
+myai_before_modelpicker.py
+task.md
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Test cache
+.pytest_cache/
+.coverage
+htmlcov/
