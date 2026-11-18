@@ -185,13 +185,22 @@ def _score_provider_health(status: str) -> Tuple[float, str]:
 
 
 def _score_context_fit(meta: dict, req_tokens: int) -> Tuple[float, str]:
-    """Score context window fit (0 - 15 points)."""
-    ctx_limit = meta.get("context_length") or meta.get("max_input_tokens")
+    """Score context window and TPM budget fit (0 - 15 points)."""
+    from core.context_budget import get_model_context_budget, get_model_tpm_limit
+    mid = meta.get("id")
+    raw_ctx = meta.get("context_length") or meta.get("max_input_tokens")
+    tpm = get_model_tpm_limit(mid) if mid else None
+
+    if tpm is not None:
+        budget = get_model_context_budget(mid)
+        ctx_limit = min(raw_ctx, budget) if raw_ctx else budget
+    else:
+        ctx_limit = raw_ctx or (get_model_context_budget(mid) if mid else None)
     if not ctx_limit:
         return 10.0, "context limit unspecified (neutral)"
 
     if ctx_limit < req_tokens:
-        return -1.0, f"insufficient context ({ctx_limit} < {req_tokens})"
+        return -1.0, f"insufficient context/TPM budget ({ctx_limit} < {req_tokens})"
 
     ratio = ctx_limit / max(1, req_tokens)
     if ratio >= 8.0:
@@ -325,6 +334,13 @@ def rank_models(
             rejected_list.append((mid, "Not verified free (blocked by AIZEN Free-Only mode)"))
             continue
         # ─────────────────────────────────────────────────────────────────
+
+        # Cooldown check (skip models currently cooling down from rate limit)
+        from core.context_budget import is_model_cooling_down
+        cooling, rem_sec = is_model_cooling_down(mid)
+        if cooling:
+            rejected_list.append((mid, f"Rate limited (cooling down for {rem_sec:.1f}s)"))
+            continue
 
         # Hard vision filter
         if task_type == TASK_VISION and not _has_vision_capability(meta):

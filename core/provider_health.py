@@ -218,6 +218,9 @@ def get_provider_for_model(model_id: str) -> str | None:
     if not model_id:
         return None
 
+    if str(model_id).startswith("ollama:"):
+        return "Ollama (Local)"
+
     meta = config.model_map.get(model_id)
     if meta:
         owned = meta.get("owned_by")
@@ -344,21 +347,30 @@ def record_failure(
     if diagnostics:
         if diagnostics.get("provider") and not provider:
             provider = diagnostics["provider"]
+        if diagnostics.get("retry_after"):
+            try:
+                wait_sec = float(diagnostics["retry_after"])
+                if wait_sec > 0:
+                    record["rate_limited_until"] = datetime.fromtimestamp(
+                        time.time() + wait_sec, tz=timezone.utc
+                    ).isoformat()
+            except Exception:
+                pass
 
     # Determine new status
     code = error_code
     consec = record["consecutive_failures"]
     has_prior_success = record["success_count"] > 0
+    err_lower = str(error).lower()
 
     if code == 401:
         record["status"] = STATUS_AUTH_ERROR
     elif code == 403:
-        err_lower = str(error).lower()
         if any(kw in err_lower for kw in ("auth", "account", "key", "credential", "unauthorized")):
             record["status"] = STATUS_AUTH_ERROR
         else:
             record["status"] = STATUS_DEGRADED
-    elif code == 429:
+    elif code in (429, 413) or "tokens per minute" in err_lower or "rate limit" in err_lower or "tpm" in err_lower:
         record["status"] = STATUS_RATE_LIMITED
     elif code is not None and 500 <= code < 600:
         record["status"] = STATUS_DEGRADED
@@ -413,12 +425,19 @@ def get_provider_status(provider_name: str) -> str:
             except ValueError:
                 pass
 
-    if last_ts is None:
-        return STATUS_UNKNOWN
-
-    age_minutes = (_now_ts() - last_ts) / 60
-    if age_minutes > STALE_MINUTES:
-        return STATUS_UNKNOWN
+    # Active rate-limit check
+    rl_until = record.get("rate_limited_until")
+    if rl_until:
+        try:
+            exp_ts = datetime.fromisoformat(rl_until).timestamp()
+            if _now_ts() < exp_ts:
+                return STATUS_RATE_LIMITED
+            else:
+                record["rate_limited_until"] = None
+                if record.get("status") == STATUS_RATE_LIMITED:
+                    record["status"] = STATUS_ONLINE if record.get("success_count", 0) > 0 else STATUS_UNKNOWN
+        except ValueError:
+            pass
 
     return record.get("status", STATUS_UNKNOWN)
 

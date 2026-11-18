@@ -29,6 +29,27 @@ from ui.console import console, show_aizen_home
 from ui.prompts import build_prompt, session
 
 
+def _is_local_model(model_id):
+    return str(model_id or "").startswith("ollama:")
+
+
+def _dispatch_send_chat(messages, model):
+    """Dispatch only namespaced local model IDs to Ollama."""
+    if _is_local_model(model):
+        from api.ollama import send_chat as local_send_chat
+        return local_send_chat(messages, model)
+    return send_chat(messages, model)
+
+
+def _dispatch_stream_chat(messages, model):
+    """Stream from the selected provider without silent provider switching."""
+    if _is_local_model(model):
+        from api.ollama import stream_chat as local_stream_chat
+        yield from local_stream_chat(messages, model)
+        return
+    yield from stream_chat(messages, model)
+
+
 # ------------------------------------------------------------------
 # ANALYTICS HELPERS
 # ------------------------------------------------------------------
@@ -290,14 +311,259 @@ def _handle_agent_proposal(answer: str):
         console.print(f"[dim red]Agent proposal execution error: {e}[/dim red]")
 
 
-def _ask_ai_non_stream(messages, chat, model_to_use=None, decision=None, fallback_used: bool = False, is_retry: bool = False):
+def _handle_api_failure(
+    error: Exception,
+    chat: dict,
+    target_model: str,
+    messages: list,
+    full_messages: list,
+    decision,
+    streaming: bool,
+    fallback_used: bool,
+    is_retry: bool,
+    attempted_models: set,
+    fallback_attempts: int,
+    t_start: float,
+):
+    from core.context_budget import (
+        clear_model_cooldown,
+        estimate_messages_tokens,
+        get_model_tpm_limit,
+        parse_api_error,
+        prepare_budgeted_messages,
+        record_detected_tpm_limit,
+        set_model_cooldown,
+    )
+    from core.free_model_registry import is_model_allowed
+    from core.provider_health import get_provider_for_model
+    from core.router import get_retry_model
+
+    router_used = bool(decision and not decision.is_manual_override)
+    router_mode = getattr(config, "router_mode", "AUTO")
+    classified_task = decision.task_type if decision else None
+    prov = get_provider_for_model(target_model)
+
+    status_code = getattr(error, "status_code", None)
+    headers = getattr(error, "response_headers", {}) or {}
+    raw_text = getattr(error, "raw_body", str(error)) or str(error)
+
+    details = parse_api_error(status_code, raw_text, headers)
+    if details.detected_tpm_limit:
+        record_detected_tpm_limit(target_model, details.detected_tpm_limit)
+    if details.retry_after and details.retry_after > 0:
+        set_model_cooldown(target_model, details.retry_after)
+
+    max_fallbacks = getattr(config, "router_max_fallbacks", 2)
+    can_retry_route = (
+        (fallback_attempts < max_fallbacks)
+        and not (decision and decision.is_manual_override)
+        and not _is_local_model(target_model)
+    )
+
+    # 1. TPM 413 or rate limit
+    if details.is_413_or_tpm or details.is_rate_limited:
+        # A. Alternative eligible verified-free model that fits
+        if can_retry_route:
+            est_toks = estimate_messages_tokens(full_messages)
+            retry_model = get_retry_model(
+                failed_model=target_model,
+                failed_provider=prov,
+                attempt=fallback_attempts + 1,
+                estimated_context_tokens=est_toks,
+                excluded_models=attempted_models,
+            )
+            if retry_model and retry_model not in attempted_models:
+                retry_prov = get_provider_for_model(retry_model)
+                if is_model_allowed(retry_prov, retry_model):
+                    rebudgeted, _, stats = prepare_budgeted_messages(full_messages, retry_model)
+                    if not stats.get("exceeds_essential"):
+                        console.print(
+                            f"[dim yellow]Primary model rate-limited / TPM exceeded — switching to eligible model ({retry_model}).[/dim yellow]"
+                        )
+                        attempted_models.add(retry_model)
+                        if streaming:
+                            return _ask_ai_stream(
+                                rebudgeted, chat, model_to_use=retry_model, decision=decision,
+                                is_retry=True, fallback_used=True,
+                                attempted_models=attempted_models,
+                                fallback_attempts=fallback_attempts + 1,
+                                full_messages=full_messages,
+                            )
+                        else:
+                            return _ask_ai_non_stream(
+                                rebudgeted, chat, model_to_use=retry_model, decision=decision,
+                                fallback_used=True, is_retry=True,
+                                attempted_models=attempted_models,
+                                fallback_attempts=fallback_attempts + 1,
+                                full_messages=full_messages,
+                            )
+
+        # B. Reduce context on target_model if wait is short and payload can be reduced
+        detected_tpm = details.detected_tpm_limit or get_model_tpm_limit(target_model) or 8000
+        smaller_budget = int(detected_tpm * 0.70)
+        rebudgeted, was_pruned, stats = prepare_budgeted_messages(full_messages, target_model, max_tokens=smaller_budget)
+        curr_toks = estimate_messages_tokens(messages)
+
+        wait_sec = details.retry_after if (details.retry_after is not None and details.retry_after > 0) else 0.0
+        max_wait = getattr(config, "max_retry_after_wait", 5.0)
+
+        if not stats.get("exceeds_essential") and wait_sec <= max_wait and (fallback_attempts < max_fallbacks) and (wait_sec > 0 or stats["final_tokens"] < curr_toks):
+            if wait_sec > 0:
+                console.print(f"[dim yellow]Rate limit hit — waiting {wait_sec:.1f}s and retrying with reduced context ({stats['final_tokens']:,} tokens)...[/dim yellow]")
+                time.sleep(wait_sec)
+            else:
+                console.print(f"[dim yellow]Retrying with reduced context ({stats['final_tokens']:,} tokens)...[/dim yellow]")
+            clear_model_cooldown(target_model)
+            if streaming:
+                return _ask_ai_stream(
+                    rebudgeted, chat, model_to_use=target_model, decision=decision,
+                    is_retry=True, fallback_used=True,
+                    attempted_models=attempted_models,
+                    fallback_attempts=fallback_attempts + 1,
+                    full_messages=full_messages,
+                )
+            else:
+                return _ask_ai_non_stream(
+                    rebudgeted, chat, model_to_use=target_model, decision=decision,
+                    fallback_used=True, is_retry=True,
+                    attempted_models=attempted_models,
+                    fallback_attempts=fallback_attempts + 1,
+                    full_messages=full_messages,
+                )
+
+        # C. Cannot retry: show clear context limit explanation
+        _rollback_last_user_message(chat)
+        _log_failure(
+            chat, target_model, None, streaming=streaming,
+            response_time_ms=(time.time() - t_start) * 1000,
+            error_code=status_code or 413,
+            error_message=str(details.error_message)[:300],
+            router_used=router_used, router_mode=router_mode,
+            classified_task=classified_task,
+            router_selected_model=target_model if router_used else None,
+        )
+
+        req_str = f"{details.requested_tokens:,}" if details.requested_tokens else f"approx. {estimate_messages_tokens(messages):,}"
+        lim_str = f"{details.detected_tpm_limit or get_model_tpm_limit(target_model) or 'platform limit'}"
+        cooldown_str = f" The provider requested a cooldown of {details.retry_after:.0f}s." if (details.retry_after and details.retry_after > 0) else ""
+
+        console.print(
+            f"\n[bold red]❌ Request Exceeds Model Capacity / TPM Limits[/bold red]\n"
+            f"[yellow]Model '{target_model}' rejected the request: {req_str} tokens requested exceeds the {lim_str} TPM limit.{cooldown_str}[/yellow]\n"
+            f"[dim]No other verified-free model is currently eligible to handle this request size.[/dim]\n\n"
+            f"[bold cyan]How to proceed:[/bold cyan]\n"
+            f"  • Start a fresh chat with [bold]/new[/bold] to clear conversation history tokens.\n"
+            f"  • Shorten your prompt or reduce attached files / project context.\n"
+            f"  • Run [bold]/free list[/bold] or [bold]/models[/bold] to browse eligible models.\n"
+        )
+        return
+
+    # 2. Connection or timeout errors
+    if isinstance(error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        err_msg = "Request timed out" if isinstance(error, requests.exceptions.Timeout) else "Connection error"
+        _record_conn_failure(target_model, None, err_msg)
+        if can_retry_route:
+            retry_model = get_retry_model(
+                failed_model=target_model,
+                failed_provider=prov,
+                attempt=fallback_attempts + 1,
+                estimated_context_tokens=estimate_messages_tokens(full_messages),
+                excluded_models=attempted_models,
+            )
+            if retry_model and retry_model not in attempted_models:
+                console.print(f"[dim yellow]Primary route unavailable — trying next eligible model ({retry_model}).[/dim yellow]")
+                attempted_models.add(retry_model)
+                rebudgeted, _, _ = prepare_budgeted_messages(full_messages, retry_model)
+                if streaming:
+                    return _ask_ai_stream(
+                        rebudgeted, chat, model_to_use=retry_model, decision=decision,
+                        is_retry=True, fallback_used=True,
+                        attempted_models=attempted_models,
+                        fallback_attempts=fallback_attempts + 1,
+                        full_messages=full_messages,
+                    )
+                else:
+                    return _ask_ai_non_stream(
+                        rebudgeted, chat, model_to_use=retry_model, decision=decision,
+                        fallback_used=fallback_used, is_retry=True,
+                        attempted_models=attempted_models,
+                        fallback_attempts=fallback_attempts + 1,
+                        full_messages=full_messages,
+                    )
+
+        _rollback_last_user_message(chat)
+        _log_failure(
+            chat, target_model, None, streaming=streaming,
+            response_time_ms=(time.time() - t_start) * 1000,
+            error_code=None, error_message=err_msg,
+            router_used=router_used, router_mode=router_mode,
+            classified_task=classified_task,
+            router_selected_model=target_model if router_used else None,
+        )
+        console.print(f"\n[bold red]{err_msg}.[/bold red]")
+        return
+
+    # 3. Other generic RuntimeError / API error
+    if can_retry_route:
+        retry_model = get_retry_model(
+            failed_model=target_model,
+            failed_provider=prov,
+            attempt=fallback_attempts + 1,
+            estimated_context_tokens=estimate_messages_tokens(full_messages),
+            excluded_models=attempted_models,
+        )
+        if retry_model and retry_model not in attempted_models:
+            console.print(f"[dim yellow]Primary route unavailable — trying next eligible model ({retry_model}).[/dim yellow]")
+            attempted_models.add(retry_model)
+            rebudgeted, _, _ = prepare_budgeted_messages(full_messages, retry_model)
+            if streaming:
+                return _ask_ai_stream(
+                    rebudgeted, chat, model_to_use=retry_model, decision=decision,
+                    is_retry=True, fallback_used=True,
+                    attempted_models=attempted_models,
+                    fallback_attempts=fallback_attempts + 1,
+                    full_messages=full_messages,
+                )
+            else:
+                return _ask_ai_non_stream(
+                    rebudgeted, chat, model_to_use=retry_model, decision=decision,
+                    fallback_used=fallback_used, is_retry=True,
+                    attempted_models=attempted_models,
+                    fallback_attempts=fallback_attempts + 1,
+                    full_messages=full_messages,
+                )
+
+    _rollback_last_user_message(chat)
+    _log_failure(
+        chat, target_model, None, streaming=streaming,
+        response_time_ms=(time.time() - t_start) * 1000,
+        error_code=status_code, error_message=str(error)[:300],
+        router_used=router_used, router_mode=router_mode,
+        classified_task=classified_task,
+        router_selected_model=target_model if router_used else None,
+    )
+    console.print(Panel(str(error), title="API Error", border_style="red"))
+
+
+def _ask_ai_non_stream(
+    messages,
+    chat,
+    model_to_use=None,
+    decision=None,
+    fallback_used: bool = False,
+    is_retry: bool = False,
+    attempted_models: set = None,
+    fallback_attempts: int = 0,
+    full_messages: list = None,
+):
     """Send request using standard non-streaming path."""
     target_model = model_to_use or config.current_model
+    attempted_models = attempted_models if attempted_models is not None else {target_model}
 
     from core.free_model_registry import is_model_allowed
     from core.provider_health import get_provider_for_model
     prov = get_provider_for_model(target_model)
-    if not is_model_allowed(prov, target_model):
+    if not _is_local_model(target_model) and not is_model_allowed(prov, target_model):
         _rollback_last_user_message(chat)
         console.print(
             f"\n[bold red]❌ Request blocked by AIZEN Free-Only mode.[/bold red]\n"
@@ -316,49 +582,7 @@ def _ask_ai_non_stream(messages, chat, model_to_use=None, decision=None, fallbac
             "[bold cyan]Aizen is thinking...[/bold cyan]",
             spinner="dots"
         ):
-            result = send_chat(messages, target_model)
-
-    except requests.exceptions.Timeout:
-        _record_conn_failure(target_model, None, "Request timed out")
-        if not is_retry and decision and not decision.is_manual_override:
-            from core.router import get_retry_model
-            retry_model = get_retry_model(target_model, decision.provider)
-            if retry_model and retry_model != target_model:
-                console.print(f"[dim yellow]Primary route unavailable — trying next eligible model ({retry_model}).[/dim yellow]")
-                return _ask_ai_non_stream(messages, chat, model_to_use=retry_model, decision=decision, fallback_used=fallback_used, is_retry=True)
-
-        _rollback_last_user_message(chat)
-        _log_failure(
-            chat, target_model, None, streaming=False,
-            response_time_ms=(time.time() - t_start) * 1000,
-            error_code=None, error_message="Request timed out",
-            router_used=router_used, router_mode=router_mode,
-            classified_task=classified_task,
-            router_selected_model=target_model if router_used else None,
-        )
-        console.print("\n[bold red]Request timed out.[/bold red]")
-        return
-
-    except requests.exceptions.ConnectionError:
-        _record_conn_failure(target_model, None, "Connection error")
-        if not is_retry and decision and not decision.is_manual_override:
-            from core.router import get_retry_model
-            retry_model = get_retry_model(target_model, decision.provider)
-            if retry_model and retry_model != target_model:
-                console.print(f"[dim yellow]Primary route unavailable — trying next eligible model ({retry_model}).[/dim yellow]")
-                return _ask_ai_non_stream(messages, chat, model_to_use=retry_model, decision=decision, fallback_used=fallback_used, is_retry=True)
-
-        _rollback_last_user_message(chat)
-        _log_failure(
-            chat, target_model, None, streaming=False,
-            response_time_ms=(time.time() - t_start) * 1000,
-            error_code=None, error_message="Connection error",
-            router_used=router_used, router_mode=router_mode,
-            classified_task=classified_task,
-            router_selected_model=target_model if router_used else None,
-        )
-        console.print("\n[bold red]Cannot connect to OmniRoute.[/bold red]")
-        return
+            result = _dispatch_send_chat(messages, target_model)
 
     except KeyboardInterrupt:
         _rollback_last_user_message(chat)
@@ -366,47 +590,21 @@ def _ask_ai_non_stream(messages, chat, model_to_use=None, decision=None, fallbac
         console.print("\n[yellow]Request cancelled.[/yellow]")
         return
 
-    except RuntimeError as error:
-        if not is_retry and decision and not decision.is_manual_override:
-            from core.router import get_retry_model
-            retry_model = get_retry_model(target_model, decision.provider)
-            if retry_model and retry_model != target_model:
-                console.print(f"[dim yellow]Primary route unavailable — trying next eligible model ({retry_model}).[/dim yellow]")
-                return _ask_ai_non_stream(messages, chat, model_to_use=retry_model, decision=decision, fallback_used=fallback_used, is_retry=True)
-
-        _rollback_last_user_message(chat)
-        _log_failure(
-            chat, target_model, None, streaming=False,
-            response_time_ms=(time.time() - t_start) * 1000,
-            error_code=None, error_message=str(error)[:300],
-            router_used=router_used, router_mode=router_mode,
-            classified_task=classified_task,
-            router_selected_model=target_model if router_used else None,
-        )
-        console.print(
-            Panel(str(error), title="API Error", border_style="red")
-        )
-        return
-
     except Exception as error:
-        if not is_retry and decision and not decision.is_manual_override:
-            from core.router import get_retry_model
-            retry_model = get_retry_model(target_model, decision.provider)
-            if retry_model and retry_model != target_model:
-                console.print(f"[dim yellow]Primary route unavailable — trying next eligible model ({retry_model}).[/dim yellow]")
-                return _ask_ai_non_stream(messages, chat, model_to_use=retry_model, decision=decision, fallback_used=fallback_used, is_retry=True)
-
-        _rollback_last_user_message(chat)
-        _log_failure(
-            chat, target_model, None, streaming=False,
-            response_time_ms=(time.time() - t_start) * 1000,
-            error_code=None, error_message=str(error)[:300],
-            router_used=router_used, router_mode=router_mode,
-            classified_task=classified_task,
-            router_selected_model=target_model if router_used else None,
+        return _handle_api_failure(
+            error=error,
+            chat=chat,
+            target_model=target_model,
+            messages=messages,
+            full_messages=full_messages or messages,
+            decision=decision,
+            streaming=False,
+            fallback_used=fallback_used,
+            is_retry=is_retry,
+            attempted_models=attempted_models,
+            fallback_attempts=fallback_attempts,
+            t_start=t_start,
         )
-        console.print(f"\n[bold red]Error: {error}[/bold red]")
-        return
 
     # Persist the assistant reply
     answer = result["answer"]
@@ -453,8 +651,10 @@ def _ask_ai_non_stream(messages, chat, model_to_use=None, decision=None, fallbac
         iteration += 1
 
         try:
+            from core.context_budget import prepare_budgeted_messages
+            budgeted_tool_msgs, _, _ = prepare_budgeted_messages(messages, target_model)
             with console.status("[bold cyan]Aizen is thinking...[/bold cyan]", spinner="dots"):
-                next_result = send_chat(messages, target_model)
+                next_result = _dispatch_send_chat(budgeted_tool_msgs, target_model)
                 answer = next_result["answer"]
                 result = next_result
         except Exception as e:
@@ -521,17 +721,28 @@ def _ask_ai_non_stream(messages, chat, model_to_use=None, decision=None, fallbac
         pass
 
 
-def _ask_ai_stream(messages, chat, model_to_use=None, decision=None, is_retry: bool = False):
+def _ask_ai_stream(
+    messages,
+    chat,
+    model_to_use=None,
+    decision=None,
+    is_retry: bool = False,
+    fallback_used: bool = False,
+    attempted_models: set = None,
+    fallback_attempts: int = 0,
+    full_messages: list = None,
+):
     """
     Send request using streaming path.
-    Falls back to non-streaming if route fails before content arrives.
+    Falls back to non-streaming or alternate model if route fails before content arrives.
     """
     target_model = model_to_use or config.current_model
+    attempted_models = attempted_models if attempted_models is not None else {target_model}
 
     from core.free_model_registry import is_model_allowed
     from core.provider_health import get_provider_for_model
     prov = get_provider_for_model(target_model)
-    if not is_model_allowed(prov, target_model):
+    if not _is_local_model(target_model) and not is_model_allowed(prov, target_model):
         _rollback_last_user_message(chat)
         console.print(
             f"\n[bold red]❌ Request blocked by AIZEN Free-Only mode.[/bold red]\n"
@@ -557,7 +768,7 @@ def _ask_ai_stream(messages, chat, model_to_use=None, decision=None, is_retry: b
     classified_task = decision.task_type if decision else None
 
     try:
-        for event_type, data in stream_chat(messages, target_model):
+        for event_type, data in _dispatch_stream_chat(messages, target_model):
             if event_type == "content":
                 chunks.append(data)
                 if not stream_flushed:
@@ -608,34 +819,23 @@ def _ask_ai_stream(messages, chat, model_to_use=None, decision=None, is_retry: b
         console.print("\n[yellow]Generation cancelled.[/yellow]")
         return
 
-    except (RuntimeError, requests.exceptions.RequestException, Exception) as error:
+    except Exception as error:
         status.stop()
         if not first_chunk_received:
-            # Record the failure passively before falling back
-            if isinstance(error, requests.exceptions.ConnectionError):
-                _record_conn_failure(target_model, None, str(error))
-            elif isinstance(error, requests.exceptions.Timeout):
-                _record_conn_failure(target_model, None, "Streaming timeout")
-
-            # Check if smart router retry is possible before falling back
-            if not is_retry and decision and not decision.is_manual_override:
-                from core.router import get_retry_model
-                retry_model = get_retry_model(target_model, decision.provider)
-                if retry_model and retry_model != target_model:
-                    console.print(
-                        f"[dim yellow]Primary route unavailable — trying next eligible model ({retry_model}).[/dim yellow]"
-                    )
-                    _ask_ai_stream(messages, chat, model_to_use=retry_model, decision=decision, is_retry=True)
-                    return
-
-            # Failed before meaningful content was received!
-            # Automatically retry once using standard non-streaming path.
-            # The fallback call will record its own analytics row (fallback_used=True).
-            console.print(
-                "[dim yellow]Streaming unavailable for this route — using standard response.[/dim yellow]"
+            return _handle_api_failure(
+                error=error,
+                chat=chat,
+                target_model=target_model,
+                messages=messages,
+                full_messages=full_messages or messages,
+                decision=decision,
+                streaming=True,
+                fallback_used=fallback_used,
+                is_retry=is_retry,
+                attempted_models=attempted_models,
+                fallback_attempts=fallback_attempts,
+                t_start=t_start,
             )
-            _ask_ai_non_stream(messages, chat, model_to_use=target_model, decision=decision, fallback_used=True, is_retry=is_retry)
-            return
         else:
             # Partial content was already printed; do not fallback to avoid duplicate text.
             sys.stdout.write("\n")
@@ -645,7 +845,7 @@ def _ask_ai_stream(messages, chat, model_to_use=None, decision=None, is_retry: b
             _log_failure(
                 chat, target_model, None, streaming=True,
                 response_time_ms=(time.time() - t_start) * 1000,
-                error_code=None,
+                error_code=getattr(error, "status_code", None),
                 error_message=str(error)[:300],
                 router_used=router_used,
                 router_mode=router_mode,
@@ -663,21 +863,41 @@ def _ask_ai_stream(messages, chat, model_to_use=None, decision=None, is_retry: b
 
     if not chunks:
         # Stream finished without any content chunks
-        if not is_retry and decision and not decision.is_manual_override:
+        max_fallbacks = getattr(config, "router_max_fallbacks", 2)
+        if fallback_attempts < max_fallbacks and not is_retry and decision and not decision.is_manual_override:
             from core.router import get_retry_model
-            retry_model = get_retry_model(target_model, decision.provider)
-            if retry_model and retry_model != target_model:
+            from core.context_budget import estimate_messages_tokens, prepare_budgeted_messages
+            est_toks = estimate_messages_tokens(full_messages or messages)
+            retry_model = get_retry_model(
+                target_model, decision.provider,
+                attempt=fallback_attempts + 1,
+                estimated_context_tokens=est_toks,
+                excluded_models=attempted_models,
+            )
+            if retry_model and retry_model not in attempted_models:
                 console.print(
                     f"[dim yellow]Primary route unavailable — trying next eligible model ({retry_model}).[/dim yellow]"
                 )
-                _ask_ai_stream(messages, chat, model_to_use=retry_model, decision=decision, is_retry=True)
-                return
+                attempted_models.add(retry_model)
+                rebudgeted, _, _ = prepare_budgeted_messages(full_messages or messages, retry_model)
+                return _ask_ai_stream(
+                    rebudgeted, chat, model_to_use=retry_model, decision=decision,
+                    is_retry=True, fallback_used=True,
+                    attempted_models=attempted_models,
+                    fallback_attempts=fallback_attempts + 1,
+                    full_messages=full_messages,
+                )
 
         console.print(
             "[dim yellow]Streaming unavailable for this route — using standard response.[/dim yellow]"
         )
-        _ask_ai_non_stream(messages, chat, model_to_use=target_model, decision=decision, fallback_used=True, is_retry=is_retry)
-        return
+        return _ask_ai_non_stream(
+            messages, chat, model_to_use=target_model, decision=decision,
+            fallback_used=True, is_retry=is_retry,
+            attempted_models=attempted_models,
+            fallback_attempts=fallback_attempts,
+            full_messages=full_messages,
+        )
 
     if first_chunk_received:
         sys.stdout.write("\n\n")
@@ -732,8 +952,10 @@ def _ask_ai_stream(messages, chat, model_to_use=None, decision=None, is_retry: b
         iteration += 1
 
         try:
+            from core.context_budget import prepare_budgeted_messages
+            budgeted_tool_msgs, _, _ = prepare_budgeted_messages(messages, target_model)
             with console.status("[bold cyan]Aizen is thinking...[/bold cyan]", spinner="dots"):
-                next_res = send_chat(messages, target_model)
+                next_res = _dispatch_send_chat(budgeted_tool_msgs, target_model)
                 full_answer = next_res["answer"]
                 done_data = {
                     "actual_model": next_res.get("actual_model"),
@@ -849,31 +1071,71 @@ def ask_ai(prompt):
     except Exception:
         pass
 
-    sys_prompt = config.SYSTEM_PROMPT
-    if getattr(config, "agent_enabled", False):
+    # Determine which model will be used so we can tailor the system prompt.
+    # For local Ollama models we use a compact prompt to avoid blowing the
+    # small context window (8 K total, 2 K reserved for output = ~5.8 K input).
+    _intended_local = (
+        _is_local_model(getattr(config, "current_model", ""))
+        or getattr(config, "provider_mode", "cloud") in {"local", "offline"}
+    )
+
+    if _intended_local:
+        # Compact prompt: skip cloud-routing verbiage, global skills, and tool docs.
+        sys_prompt = getattr(config, "LOCAL_SYSTEM_PROMPT", config.SYSTEM_PROMPT).strip()
+        # Agent suffix is still small and relevant locally (keep if enabled)
+        if getattr(config, "agent_enabled", False):
+            try:
+                from core.agent_manager import get_agent_prompt_suffix
+                sys_prompt += get_agent_prompt_suffix()
+            except Exception:
+                pass
+        # Skills: include only project-local rules (not global ~/.gemini skills),
+        # and cap their contribution so they never exceed half the input budget.
         try:
-            from core.agent_manager import get_agent_prompt_suffix
-            sys_prompt += get_agent_prompt_suffix()
+            from core.skill_loader import get_loaded_skills
+            _local_input_budget = int(getattr(config, "OLLAMA_MAX_INPUT_TOKENS", 5832))
+            _skills_budget = _local_input_budget // 2  # at most half for skills
+            _skills_chars = _skills_budget * 4           # rough chars from token est
+            skills_lines = ["## Active Project Rules"]
+            _used = 0
+            for sk in get_loaded_skills():
+                if sk.category in ("rule", "workflow"):  # local project rules only
+                    entry = f"### {sk.name}\n{sk.content.strip()}\n"
+                    if _used + len(entry) > _skills_chars:
+                        break
+                    skills_lines.append(entry)
+                    _used += len(entry)
+            if len(skills_lines) > 1:
+                sys_prompt += "\n\n" + "\n".join(skills_lines)
+        except Exception:
+            pass
+        # Tools: skip for local models (Ollama doesn't use the cloud tool schema)
+    else:
+        sys_prompt = config.SYSTEM_PROMPT
+        if getattr(config, "agent_enabled", False):
+            try:
+                from core.agent_manager import get_agent_prompt_suffix
+                sys_prompt += get_agent_prompt_suffix()
+            except Exception:
+                pass
+
+        # Active Agent Skills & Rules (cloud path — full context)
+        try:
+            from core.skill_loader import build_skills_context
+            skills_ctx = build_skills_context()
+            if skills_ctx:
+                sys_prompt += "\n\n" + skills_ctx
         except Exception:
             pass
 
-    # Active Agent Skills & Rules
-    try:
-        from core.skill_loader import build_skills_context
-        skills_ctx = build_skills_context()
-        if skills_ctx:
-            sys_prompt += "\n\n" + skills_ctx
-    except Exception:
-        pass
-
-    # Native Tool Capabilities
-    try:
-        from core.tool_registry import registry
-        tools_prompt = registry.get_tools_prompt()
-        if tools_prompt:
-            sys_prompt += "\n\n" + tools_prompt
-    except Exception:
-        pass
+        # Native Tool Capabilities
+        try:
+            from core.tool_registry import registry
+            tools_prompt = registry.get_tools_prompt()
+            if tools_prompt:
+                sys_prompt += "\n\n" + tools_prompt
+        except Exception:
+            pass
 
     messages = [{"role": "system", "content": sys_prompt}]
 
@@ -931,6 +1193,11 @@ def ask_ai(prompt):
 
     # Phase 11: Smart Router
     from core.router import route, format_verbose_routing
+    from core.context_budget import (
+        estimate_messages_tokens,
+        prepare_budgeted_messages,
+    )
+
     context_details = {
         "has_project": bool(config.last_project_sources),
         "has_rag": bool(config.last_rag_sources),
@@ -948,24 +1215,90 @@ def ask_ai(prompt):
     except Exception:
         pass
 
+    raw_tokens = estimate_messages_tokens(messages)
+    context_details["estimated_tokens"] = raw_tokens
+
     decision = route(prompt, context_details)
     model_to_use = decision.selected_model
 
     if not model_to_use:
         _rollback_last_user_message(chat)
-        console.print(
-            "\n[bold red]❌ No verified-free model is currently available for this task.[/bold red]\n"
-            "[dim]Paid/unknown models are blocked by AIZEN Free-Only mode. Use /pick or /free list to see eligible models.[/dim]\n"
-        )
+        if getattr(config, "provider_mode", "cloud") in {"local", "offline"}:
+            console.print(
+                "\n[bold red]❌ No installed Ollama model is available.[/bold red]\n"
+                "[dim]Start Ollama and install a model (for example: ollama pull qwen3:4b). "
+                "AIZEN will not fall back to cloud in local/offline mode.[/dim]\n"
+            )
+        else:
+            console.print(
+                "\n[bold red]❌ No verified-free cloud model is currently available for this task.[/bold red]\n"
+                "[dim]Paid/unknown models are blocked by AIZEN Free-Only mode. Use /pick or /free list to see eligible models.[/dim]\n"
+            )
         return
+
+    # Budget messages safely for model_to_use
+    budgeted_messages, was_pruned, prune_stats = prepare_budgeted_messages(messages, model_to_use)
+
+    # Check if prompt + system instructions alone exceed model budget
+    if prune_stats.get("exceeds_essential"):
+        alt_model = None
+        if decision and not decision.is_manual_override:
+            from core.router import get_retry_model
+            from core.free_model_registry import is_model_allowed
+            from core.provider_health import get_provider_for_model
+            cand = get_retry_model(
+                failed_model=model_to_use,
+                failed_provider=decision.provider,
+                attempt=1,
+                estimated_context_tokens=prune_stats["final_tokens"],
+                excluded_models={model_to_use},
+            )
+            if cand and is_model_allowed(get_provider_for_model(cand), cand):
+                cand_budgeted, _, cand_stats = prepare_budgeted_messages(messages, cand)
+                if not cand_stats.get("exceeds_essential"):
+                    alt_model = cand
+                    model_to_use = cand
+                    budgeted_messages = cand_budgeted
+                    prune_stats = cand_stats
+                    console.print(f"[dim yellow]Prompt exceeds {decision.selected_model} budget — routed to {alt_model}.[/dim yellow]")
+
+        if prune_stats.get("exceeds_essential"):
+            _rollback_last_user_message(chat)
+            # Build detailed diagnostics to help the user understand what consumed tokens
+            _sys_toks = estimate_messages_tokens([messages[0]]) if messages else 0
+            _user_msg_toks = prune_stats.get("final_tokens", 0) - _sys_toks
+            _budget = prune_stats["budget"]
+            _total = prune_stats["final_tokens"]
+            console.print(
+                f"\n[bold red]❌ Request Exceeds Model Capacity[/bold red]\n"
+                f"[yellow]The prompt and essential instructions (~{_total:,} tokens) "
+                f"exceed the input budget for '{model_to_use}' ({_budget:,} tokens).[/yellow]\n"
+                f"\n[bold cyan]Token breakdown:[/bold cyan]\n"
+                f"  • System instructions: ~{_sys_toks:,} tokens\n"
+                f"  • Current message:     ~{max(0, _user_msg_toks):,} tokens\n"
+                f"  • Input budget:         {_budget:,} tokens\n"
+                f"\n[bold cyan]How to proceed:[/bold cyan]\n"
+                f"  • Start a fresh chat with [bold]/new[/bold] to clear conversation history.\n"
+                f"  • Shorten your prompt or reduce attached files / project context.\n"
+                f"  • Run [bold]/free list[/bold] or [bold]/models[/bold] to browse eligible models.\n"
+            )
+            return
 
     if getattr(config, "router_verbose", False):
         console.print(format_verbose_routing(decision))
 
+    attempted_models = {model_to_use}
+
     if config.streaming_enabled:
-        _ask_ai_stream(messages, chat, model_to_use=model_to_use, decision=decision)
+        _ask_ai_stream(
+            budgeted_messages, chat, model_to_use=model_to_use, decision=decision,
+            attempted_models=attempted_models, fallback_attempts=0, full_messages=messages,
+        )
     else:
-        _ask_ai_non_stream(messages, chat, model_to_use=model_to_use, decision=decision)
+        _ask_ai_non_stream(
+            budgeted_messages, chat, model_to_use=model_to_use, decision=decision,
+            attempted_models=attempted_models, fallback_attempts=0, full_messages=messages,
+        )
 
 
 def _rollback_last_user_message(chat):
@@ -1050,7 +1383,14 @@ def _startup():
         clean_stale_temp_audio_files()
     except Exception:
         pass
-    fetch_models()          # silent on failure — home screen shows ● Offline
+    if getattr(config, "provider_mode", "cloud") == "offline":
+        from api.ollama import fetch_models as fetch_local_models
+        fetch_local_models(show_message=False)
+    else:
+        fetch_models()      # silent on failure — home screen shows ● Offline
+        if getattr(config, "provider_mode", "cloud") == "local":
+            from api.ollama import fetch_models as fetch_local_models
+            fetch_local_models(show_message=False)
     try:
         from core.storage import validate_and_sanitize_configured_model
         valid, warn = validate_and_sanitize_configured_model()

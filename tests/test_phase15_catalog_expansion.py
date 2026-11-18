@@ -50,9 +50,25 @@ from core.free_model_registry import (
 
 
 class TestPhase15CatalogExpansion(unittest.TestCase):
+    # ── Canonical test models that must behave as VERIFIED FREE ──────────────
+    # Production _INITIAL_REGISTRY_RECORDS use verified_at dates from Oct 2026,
+    # which are intentionally left as-is (they are genuinely stale as of Nov 2026
+    # because no new evidence was gathered). Tests that need a known-fresh
+    # verified-free model re-register these using today's date as a controlled
+    # test fixture, exercising the "model IS verified free" code path
+    # independently of when the production records were last reviewed.
+    _TEST_FREE_MODELS = [
+        ("groq",     "groq/openai/gpt-oss-120b",                          "GPT-OSS 120B"),
+        ("groq",     "groq/openai/gpt-oss-20b",                           "GPT-OSS 20B"),
+        ("aihorde",  "aihorde/aphrodite/TheDrummer/Cydonia-24B-v4.3",     "Cydonia 24B (AI Horde)"),
+        ("aihorde",  "aihorde/aphrodite/TheDrummer/Skyfall-31B-v4.2",     "Skyfall 31B (AI Horde)"),
+        ("aihorde",  "aihorde/google/gemma-4-31b",                        "Gemma 4 31B (AI Horde)"),
+    ]
+
     def setUp(self):
         # Reset global registry to defaults
-        get_free_registry().reset_defaults()
+        reg = get_free_registry()
+        reg.reset_defaults()
         config.free_verification_days = 30
         config.model_catalog = []
         config.model_map = {}
@@ -60,6 +76,19 @@ class TestPhase15CatalogExpansion(unittest.TestCase):
         config.model_selection_mode = "ROUTER"
         config.router_mode = "AUTO"
         config.router_enabled = True
+
+        # Re-register core free models with today's date as a controlled
+        # test fixture so tests that exercise the "verified-free" code path
+        # always see a fresh record. Production verified_at dates remain
+        # unchanged (Oct 2026, now stale); this only affects the in-memory
+        # registry for the duration of the current test.
+        _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for _prov, _mid, _disp in self._TEST_FREE_MODELS:
+            reg.verify_model(
+                provider=_prov, model=_mid, display_name=_disp,
+                source="Test fixture — controlled fresh date for test isolation",
+                verified_at=_today, save=False,
+            )
 
     # 1. Verified free model is accepted
     def test_01_verified_free_models_accepted(self):
@@ -121,13 +150,17 @@ class TestPhase15CatalogExpansion(unittest.TestCase):
 
     # 6. Future provider works through registry data without code changes
     def test_06_future_provider_works_data_driven(self):
+        # Use today's date so this fixture is never stale — the test verifies
+        # that a *newly* registered model flows through the registry correctly,
+        # not that any specific calendar date is involved.
+        _fresh_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         future_rec = FreeModelRecord(
             provider="futurecloud",
             model="futurecloud/super-zero-cost",
             display_name="Super Zero Cost",
             free_verified=True,
             verification_source="https://futurecloud.example/zero-cost",
-            verified_at="2026-10-05",
+            verified_at=_fresh_date,
             notes="Documented public zero-cost access",
         )
         register_model(future_rec)
@@ -235,6 +268,9 @@ class TestPhase15CatalogExpansion(unittest.TestCase):
     # 16. Registry overlay does not destroy existing records; refresh merges safely
     def test_16_registry_overlay_and_refresh_merge(self):
         reg = get_free_registry()
+        # Use today's date for the overlay fixture so it is not stale.
+        # The test verifies merge/overlay mechanics, not that Oct 2026 is fresh.
+        _fresh_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as tf:
             overlay_data = [
                 {
@@ -243,7 +279,7 @@ class TestPhase15CatalogExpansion(unittest.TestCase):
                     "display_name": "Custom LLM",
                     "free_verified": True,
                     "verification_source": "User audit",
-                    "verified_at": "2026-10-05",
+                    "verified_at": _fresh_date,
                     "notes": "Custom user overlay entry",
                 }
             ]
@@ -312,7 +348,9 @@ class TestPhase15CatalogExpansion(unittest.TestCase):
             {"id": "prov-stale/stale-model", "owned_by": "prov-stale", "context_length": 100000},  # STALE
         ]
 
-        today = date(2026, 10, 5)
+        # rank_models uses the live clock; groq/openai/gpt-oss-120b is fresh
+        # because setUp re-registered it with today's date as a test fixture.
+        # The unused `today` local was removed — it was never passed to rank_models.
         scored, rejected = rank_models("CODING", estimated_context_tokens=1500)
 
         # Scored MUST contain only the verified-free model

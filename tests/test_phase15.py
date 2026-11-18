@@ -290,6 +290,23 @@ class TestProviderSummaryFix(unittest.TestCase):
 # ══════════════════════════════════════════════════════════
 
 class TestModelSystem(unittest.TestCase):
+    def setUp(self):
+        # fetch_models() filters the catalog through the global registry.
+        # Production verified_at dates are Oct 2026 (now stale). Re-register
+        # groq/openai/gpt-oss-120b with today's date so the filter correctly
+        # passes it into config.model_catalog during this test.
+        from datetime import datetime, timezone
+        from core.free_model_registry import get_free_registry
+        reg = get_free_registry()
+        reg.reset_defaults()
+        _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        reg.verify_model(
+            provider="groq", model="groq/openai/gpt-oss-120b",
+            display_name="GPT-OSS 120B",
+            source="Test fixture — controlled fresh date for test isolation",
+            verified_at=_today, save=False,
+        )
+
     def test_model_catalog_is_list(self):
         import config
         self.assertIsInstance(config.model_catalog, list)

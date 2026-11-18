@@ -51,24 +51,39 @@ def estimate_chat_tokens():
     return total
 
 
-def get_context_status():
+def get_context_status(model_id=None):
     """
-    Return a dict describing how much of the model's context window is used.
+    Return a dict describing how much of the model's context window / safe budget is used.
 
         {
             "used":      int,
             "limit":     int | None,
             "remaining": int | None,
-            "percent":   float | None
+            "percent":   float | None,
+            "budget":    int | None,
+            "tpm_limit": int | None,
         }
     """
+    from core.context_budget import get_model_context_budget, get_model_tpm_limit
     from core.model_manager import get_model_context_limit
 
+    mid = model_id or config.current_model
     used = estimate_chat_tokens()
-    limit = get_model_context_limit()
+    raw_limit = get_model_context_limit(mid)
+    budget = get_model_context_budget(mid)
+    tpm_limit = get_model_tpm_limit(mid)
+
+    limit = budget or raw_limit
 
     if not limit:
-        return {"used": used, "limit": None, "remaining": None, "percent": None}
+        return {
+            "used": used,
+            "limit": None,
+            "remaining": None,
+            "percent": None,
+            "budget": budget,
+            "tpm_limit": tpm_limit,
+        }
 
     limit = int(limit)
     remaining = max(0, limit - used)
@@ -78,7 +93,9 @@ def get_context_status():
         "used": used,
         "limit": limit,
         "remaining": remaining,
-        "percent": percent
+        "percent": percent,
+        "budget": budget,
+        "tpm_limit": tpm_limit,
     }
 
 

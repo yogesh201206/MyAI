@@ -1,0 +1,468 @@
+"""
+tests/test_groq_tpm_fix.py — Comprehensive tests for Groq TPM 413 error resolution.
+
+Validates:
+  1. Configurable context budget and TPM limit recognition for models (e.g. groq/openai/gpt-oss-20b).
+  2. Safe trimming & summarization of old conversation messages while preserving latest user prompt & system prompt.
+  3. Saved chat history in storage/memory is NEVER deleted or mutated to reduce request size.
+  4. Detection of oversized prompts where essential prompt exceeds model capacity.
+  5. Accurate HTTP 413/429 parsing, including status code, headers, retry_after, limit, and requested tokens.
+  6. Recovery on 413 via eligible alternative verified-free model with rebudgeted payload.
+  7. Short retry-after wait & retry with reduced context vs long retry-after non-blocking exit.
+  8. Prevention of infinite fallback loops and avoiding sending identical oversized payloads.
+  9. Strict free-only policy enforcement (never falling back to paid or unverified models).
+  10. Context budgeting during tool execution follow-up turns.
+"""
+
+import os
+import sys
+import time
+import unittest
+from unittest.mock import MagicMock, patch
+
+sys.path.insert(0, "/home/yoges/myai")
+
+import config
+from core.context_budget import (
+    APIErrorDetails,
+    clear_model_cooldown,
+    estimate_message_tokens,
+    estimate_messages_tokens,
+    get_model_context_budget,
+    get_model_tpm_limit,
+    is_model_cooling_down,
+    parse_api_error,
+    prepare_budgeted_messages,
+    record_detected_tpm_limit,
+    set_model_cooldown,
+)
+
+
+class TestGroqTPMProtection(unittest.TestCase):
+
+    def setUp(self):
+        config.current_model = "groq/openai/gpt-oss-20b"
+        config.model_selection_mode = "ROUTER"
+        config.router_mode = "AUTO"
+        config.router_enabled = True
+        config.router_max_fallbacks = 2
+        config.streaming_enabled = False
+        config.chats = []
+        config.current_chat_id = None
+        config.model_context_budgets = {}
+        config.model_tpm_limits = {}
+        config.context_budget_safety_factor = 0.80
+        config.max_retry_after_wait = 5.0
+
+        # Reset detected state
+        from core import context_budget
+        context_budget._detected_tpm_limits.clear()
+        context_budget._model_cooldowns.clear()
+
+    # --------------------------------------------------------------
+    # 1. Context Budget & TPM Limits
+    # --------------------------------------------------------------
+
+    def test_01_groq_gpt_oss_20b_has_tpm_limit_and_safe_budget(self):
+        """groq/openai/gpt-oss-20b must have known TPM limit 8,000 and safe budget 6,400."""
+        tpm = get_model_tpm_limit("groq/openai/gpt-oss-20b")
+        self.assertEqual(tpm, 8000)
+
+        # 8000 * 0.80 = 6400
+        budget = get_model_context_budget("groq/openai/gpt-oss-20b")
+        self.assertEqual(budget, 6400)
+
+    def test_02_configurable_budget_and_tpm_overrides(self):
+        """User settings in config must override defaults."""
+        config.model_tpm_limits["groq/openai/gpt-oss-20b"] = 10000
+        self.assertEqual(get_model_tpm_limit("groq/openai/gpt-oss-20b"), 10000)
+        self.assertEqual(get_model_context_budget("groq/openai/gpt-oss-20b"), 8000)
+
+        # Explicit user budget override
+        config.model_context_budgets["groq/openai/gpt-oss-20b"] = 5000
+        self.assertEqual(get_model_context_budget("groq/openai/gpt-oss-20b"), 5000)
+
+    def test_03_runtime_detected_tpm_limit_updates_budget(self):
+        """TPM limits detected at runtime from API responses must dynamically update budget."""
+        record_detected_tpm_limit("test-provider/test-model", 4000)
+        self.assertEqual(get_model_tpm_limit("test-provider/test-model"), 4000)
+        # 4000 * 0.80 = 3200
+        self.assertEqual(get_model_context_budget("test-provider/test-model"), 3200)
+
+    # --------------------------------------------------------------
+    # 2. Pruning & Summarization of Long Chat History
+    # --------------------------------------------------------------
+
+    def test_04_long_chat_history_pruned_safely_below_budget(self):
+        """Old conversation turns must be pruned/summarized when exceeding budget."""
+        budget = 6400
+        system_msg = {"role": "system", "content": "You are AIZEN AI. Standard instructions."}
+        latest_user = {"role": "user", "content": "What is the final answer?"}
+
+        # Create 25 back-and-forth turns of ~500 tokens each (~12,500 tokens total)
+        messages = [system_msg]
+        for i in range(25):
+            messages.append({"role": "user", "content": f"User question {i}: " + ("x" * 1000)})
+            messages.append({"role": "assistant", "content": f"Assistant reply {i}: " + ("y" * 1000)})
+        messages.append(latest_user)
+
+        total_tokens = estimate_messages_tokens(messages)
+        self.assertGreater(total_tokens, 12000, "Original payload should exceed 12,000 tokens")
+
+        budgeted_msgs, was_pruned, stats = prepare_budgeted_messages(
+            messages, "groq/openai/gpt-oss-20b", max_tokens=budget
+        )
+
+        self.assertTrue(was_pruned)
+        self.assertLessEqual(stats["final_tokens"], budget)
+        self.assertGreater(stats["pruned_turns"], 0)
+
+        # Essential system prompt MUST be preserved
+        self.assertEqual(budgeted_msgs[0]["content"], system_msg["content"])
+
+        # Latest user message MUST be preserved
+        self.assertEqual(budgeted_msgs[-1]["content"], latest_user["content"])
+
+        # Must include summarization notice
+        summary_found = any("[Earlier conversation history" in str(m.get("content", "")) for m in budgeted_msgs)
+        self.assertTrue(summary_found, "Must include condensation notice for pruned turns")
+
+    def test_05_saved_chat_history_is_never_deleted_to_reduce_request_size(self):
+        """Pruning for request dispatch must never alter chat['messages'] in saved chats."""
+        from core.chat_manager import create_new_chat, get_current_chat
+        create_new_chat()
+        chat = get_current_chat()
+
+        # Add 10 messages to chat
+        for i in range(10):
+            chat["messages"].append({"role": "user", "content": f"Message {i}: " + ("data " * 200)})
+
+        original_count = len(chat["messages"])
+        self.assertEqual(original_count, 10)
+
+        # Build raw dispatch messages
+        dispatch_msgs = [{"role": "system", "content": "sys"}] + chat["messages"]
+
+        # Run budgeting with small budget (e.g. 1000 tokens)
+        budgeted, was_pruned, stats = prepare_budgeted_messages(dispatch_msgs, "groq/openai/gpt-oss-20b", max_tokens=1000)
+
+        self.assertTrue(was_pruned)
+        # Verify saved chat history is STILL 10 items!
+        self.assertEqual(len(chat["messages"]), original_count)
+        self.assertEqual(chat["messages"][0]["content"], f"Message 0: " + ("data " * 200))
+        self.assertEqual(chat["messages"][-1]["content"], f"Message 9: " + ("data " * 200))
+
+    # --------------------------------------------------------------
+    # 3. Oversized Essential Prompt Detection
+    # --------------------------------------------------------------
+
+    def test_06_oversized_prompt_alone_exceeds_budget(self):
+        """When user prompt alone exceeds budget, exceeds_essential flag is set."""
+        budget = 6400
+        # 30,000 chars ~= 7,500 tokens > 6,400 budget
+        massive_prompt = "Explain this code: " + ("word " * 6000)
+        messages = [
+            {"role": "system", "content": "Essential system instructions"},
+            {"role": "user", "content": massive_prompt},
+        ]
+
+        budgeted, was_pruned, stats = prepare_budgeted_messages(
+            messages, "groq/openai/gpt-oss-20b", max_tokens=budget
+        )
+
+        self.assertTrue(stats.get("exceeds_essential"))
+        # Must preserve the latest user message without silent data corruption
+        self.assertEqual(budgeted[-1]["content"], massive_prompt)
+
+    # --------------------------------------------------------------
+    # 4. HTTP 413 / 429 Parsing & retry_after Extraction
+    # --------------------------------------------------------------
+
+    def test_07_parse_groq_tpm_413_error_message(self):
+        """Parse real-world Groq TPM 413 error string."""
+        raw_error = (
+            "Rate limit reached for model `openai/gpt-oss-20b` in organization `org-xyz` "
+            "on tokens per minute (TPM): Limit 8000, Used 0, Requested 12616. "
+            "Please try again in 35s."
+        )
+        details: APIErrorDetails = parse_api_error(413, raw_error, headers={"Retry-After": "35"})
+
+        self.assertEqual(details.status_code, 413)
+        self.assertTrue(details.is_413_or_tpm)
+        self.assertTrue(details.is_rate_limited)
+        self.assertEqual(details.retry_after, 35.0)
+        self.assertEqual(details.detected_tpm_limit, 8000)
+        self.assertEqual(details.requested_tokens, 12616)
+
+    def test_08_parse_json_error_with_retry_after(self):
+        """Parse structured JSON rate-limit error response."""
+        json_error = (
+            '{"error": {"message": "Rate limit exceeded. TPM limit: 8000. Requested: 10000", '
+            '"type": "tokens", "code": "rate_limit_exceeded", "retry_after": 12.5}}'
+        )
+        details = parse_api_error(429, json_error)
+
+        self.assertEqual(details.status_code, 429)
+        self.assertTrue(details.is_413_or_tpm)
+        self.assertTrue(details.is_rate_limited)
+        self.assertEqual(details.retry_after, 12.5)
+        self.assertEqual(details.detected_tpm_limit, 8000)
+
+    # --------------------------------------------------------------
+    # 5. Cooldown Tracking
+    # --------------------------------------------------------------
+
+    def test_09_model_cooldown_tracking(self):
+        """Model cooldown is set and expires correctly."""
+        set_model_cooldown("groq/openai/gpt-oss-20b", 2.0)
+        cooling, rem = is_model_cooling_down("groq/openai/gpt-oss-20b")
+        self.assertTrue(cooling)
+        self.assertGreater(rem, 0.0)
+
+        clear_model_cooldown("groq/openai/gpt-oss-20b")
+        cooling_after, _ = is_model_cooling_down("groq/openai/gpt-oss-20b")
+        self.assertFalse(cooling_after)
+
+    # --------------------------------------------------------------
+    # 6. Fallback Recovery on 413 & Free-Only Policy Enforcement
+    # --------------------------------------------------------------
+
+    def test_10_http_413_switches_to_eligible_verified_free_model(self):
+        """On 413 error, system switches to alternative eligible verified-free model."""
+        import app
+        from api.omniroute import OmniRouteAPIError
+        from core.router import RoutingDecision
+
+        chat = {"id": "test-chat", "title": "Test Chat", "messages": []}
+        full_messages = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Question"},
+        ]
+        decision = RoutingDecision(
+            task_type="CHAT",
+            selected_model="groq/openai/gpt-oss-20b",
+            provider="groq",
+            reason="Primary",
+            confidence=0.9,
+            candidate_count=2,
+            free_candidate_count=2,
+            factors={},
+            evaluated_candidates=[],
+            rejected_candidates=[],
+            is_manual_override=False,
+            fallback_used=False,
+            router_enabled=True,
+        )
+
+        error_413 = OmniRouteAPIError(
+            "Rate limit reached on TPM: Limit 8000, Requested 12616. Please try again in 35s.",
+            status_code=413,
+            retry_after=35.0,
+            detected_tpm_limit=8000,
+            requested_tokens=12616,
+        )
+
+        with patch("core.router.get_retry_model", return_value="aihorde/google/gemma-4-31b") as mock_retry, \
+             patch("core.free_model_registry.is_model_allowed", return_value=True), \
+             patch("core.provider_health.get_provider_for_model", return_value="aihorde"), \
+             patch("app.send_chat") as mock_send:
+
+            mock_send.return_value = {
+                "answer": "Fallback response from Gemma",
+                "actual_model": "aihorde/google/gemma-4-31b",
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "response_time": 0.5,
+            }
+
+            app._handle_api_failure(
+                error=error_413,
+                chat=chat,
+                target_model="groq/openai/gpt-oss-20b",
+                messages=full_messages,
+                full_messages=full_messages,
+                decision=decision,
+                streaming=False,
+                fallback_used=False,
+                is_retry=False,
+                attempted_models={"groq/openai/gpt-oss-20b"},
+                fallback_attempts=0,
+                t_start=time.time(),
+            )
+
+            # Successfully called alternative model
+            mock_send.assert_called_once()
+            called_model = mock_send.call_args[0][1]
+            self.assertEqual(called_model, "aihorde/google/gemma-4-31b")
+
+    def test_11_fallback_never_switches_to_paid_model(self):
+        """If candidate model is paid/unverified, fallback must reject it."""
+        import app
+        from api.omniroute import OmniRouteAPIError
+        from core.router import RoutingDecision
+
+        chat = {"id": "test-chat", "title": "Test Chat", "messages": []}
+        full_messages = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Question"},
+        ]
+        decision = RoutingDecision(
+            task_type="CHAT",
+            selected_model="groq/openai/gpt-oss-20b",
+            provider="groq",
+            reason="Primary",
+            confidence=0.9,
+            candidate_count=2,
+            free_candidate_count=2,
+            factors={},
+            evaluated_candidates=[],
+            rejected_candidates=[],
+            is_manual_override=False,
+            fallback_used=False,
+            router_enabled=True,
+        )
+
+        error_413 = OmniRouteAPIError(
+            "Rate limit reached on TPM: Limit 8000, Requested 12616. Please try again in 35s.",
+            status_code=413,
+            retry_after=35.0,
+        )
+
+        # Return a paid candidate model
+        with patch("core.router.get_retry_model", return_value="nvidia/openai/gpt-oss-20b"), \
+             patch("core.free_model_registry.is_model_allowed", return_value=False), \
+             patch("core.provider_health.get_provider_for_model", return_value="nvidia"), \
+             patch("app.send_chat") as mock_send:
+
+            app._handle_api_failure(
+                error=error_413,
+                chat=chat,
+                target_model="groq/openai/gpt-oss-20b",
+                messages=full_messages,
+                full_messages=full_messages,
+                decision=decision,
+                streaming=False,
+                fallback_used=False,
+                is_retry=False,
+                attempted_models={"groq/openai/gpt-oss-20b"},
+                fallback_attempts=0,
+                t_start=time.time(),
+            )
+
+            # Must NOT call paid model
+            mock_send.assert_not_called()
+
+    # --------------------------------------------------------------
+    # 7. Infinite Fallback Loop Prevention
+    # --------------------------------------------------------------
+
+    def test_12_fallback_stops_after_max_attempts(self):
+        """When fallback_attempts reaches max_fallbacks, no further dispatch is made."""
+        import app
+        from api.omniroute import OmniRouteAPIError
+        from core.router import RoutingDecision
+
+        chat = {"id": "test-chat", "title": "Test Chat", "messages": []}
+        messages = [{"role": "user", "content": "hello"}]
+        decision = RoutingDecision(
+            task_type="CHAT",
+            selected_model="groq/openai/gpt-oss-20b",
+            provider="groq",
+            reason="Primary",
+            confidence=0.9,
+            candidate_count=1,
+            free_candidate_count=1,
+            factors={},
+            evaluated_candidates=[],
+            rejected_candidates=[],
+            is_manual_override=False,
+            fallback_used=True,
+            router_enabled=True,
+        )
+
+        error_413 = OmniRouteAPIError("Limit 8000 exceeded", status_code=413)
+
+        with patch("app.send_chat") as mock_send, \
+             patch("core.router.get_retry_model") as mock_retry:
+
+            app._handle_api_failure(
+                error=error_413,
+                chat=chat,
+                target_model="groq/openai/gpt-oss-20b",
+                messages=messages,
+                full_messages=messages,
+                decision=decision,
+                streaming=False,
+                fallback_used=True,
+                is_retry=True,
+                attempted_models={"groq/openai/gpt-oss-20b", "aihorde/other"},
+                fallback_attempts=2,  # Already at max_fallbacks
+                t_start=time.time(),
+            )
+
+            mock_send.assert_not_called()
+            mock_retry.assert_not_called()
+
+    # --------------------------------------------------------------
+    # 8. Retry-After Wait Handling
+    # --------------------------------------------------------------
+
+    def test_13_short_retry_after_waits_and_reduces_context(self):
+        """When retry-after is short (<= 5s) and context can be reduced, waits and retries."""
+        import app
+        from api.omniroute import OmniRouteAPIError
+
+        chat = {"id": "test-chat", "title": "Test Chat", "messages": []}
+        # Multi-turn messages that can be pruned
+        full_messages = [
+            {"role": "system", "content": "sys prompt"},
+            {"role": "user", "content": "old question " + ("x" * 2000)},
+            {"role": "assistant", "content": "old answer " + ("y" * 2000)},
+            {"role": "user", "content": "latest question"},
+        ]
+        # Current payload that was sent unpruned
+        current_messages = list(full_messages)
+
+        error_429 = OmniRouteAPIError(
+            "Rate limited. Limit 8000, Requested 9000. Try again in 2s.",
+            status_code=429,
+            retry_after=2.0,
+            detected_tpm_limit=8000,
+        )
+
+        with patch("core.router.get_retry_model", return_value=None), \
+             patch("app.time.sleep") as mock_sleep, \
+             patch("app.send_chat") as mock_send:
+
+            mock_send.return_value = {
+                "answer": "Success after wait",
+                "actual_model": "groq/openai/gpt-oss-20b",
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "response_time": 0.2,
+            }
+
+            app._handle_api_failure(
+                error=error_429,
+                chat=chat,
+                target_model="groq/openai/gpt-oss-20b",
+                messages=current_messages,
+                full_messages=full_messages,
+                decision=None,
+                streaming=False,
+                fallback_used=False,
+                is_retry=False,
+                attempted_models={"groq/openai/gpt-oss-20b"},
+                fallback_attempts=0,
+                t_start=time.time(),
+            )
+
+            # Must have slept for 2.0 seconds
+            mock_sleep.assert_called_once_with(2.0)
+            mock_send.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

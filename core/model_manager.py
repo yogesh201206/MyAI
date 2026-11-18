@@ -18,9 +18,11 @@ from ui.console import console
 # ------------------------------------------------------------------
 
 def get_model_meta(model_id=None):
-    """Return the raw metadata dict for model_id (defaults to current model)."""
+    """Return metadata for a cloud or local model."""
     if model_id is None:
         model_id = config.current_model
+    if str(model_id).startswith("ollama:"):
+        return getattr(config, "local_model_map", {}).get(model_id)
     return config.model_map.get(model_id)
 
 
@@ -148,6 +150,23 @@ def select_model(argument):
         console.print("[yellow]Usage: /use <number|model-id>[/yellow]")
         return
 
+    # Local model selection is validated against Ollama's installed model list,
+    # not the cloud Free-Only registry.
+    if value.startswith("ollama:"):
+        from api.ollama import fetch_models
+        local_models = fetch_models(show_message=False)
+        if value not in {m.get("id") for m in local_models}:
+            console.print(f"[yellow]Local model '{value}' is not installed in Ollama.[/yellow]")
+            return
+        config.current_model = value
+        if getattr(config, "provider_mode", "cloud") != "offline":
+            config.provider_mode = "local"
+        config.model_selection_mode = "manual"
+        save_config()
+        console.print(f"\\n[bold green]✓ Local model selected:[/bold green] [cyan]{value}[/cyan] [green](LOCAL)[/green]\\n")
+        show_model_info(selected_message=True)
+        return
+
     selected_id = None
 
     if value.isdigit():
@@ -167,6 +186,7 @@ def select_model(argument):
     # Special handling for "auto"
     if selected_id == "auto":
         config.current_model = "auto"
+        config.provider_mode = "cloud"
         config.model_selection_mode = "router"
         save_config()
         console.print("\n[bold green]✓ AUTO mode enabled (Free-Only Smart Router).[/bold green]\n")
@@ -191,6 +211,7 @@ def select_model(argument):
         return
 
     config.current_model = selected_id
+    config.provider_mode = "cloud"
     config.model_selection_mode = "manual"
     save_config()
 

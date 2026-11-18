@@ -19,8 +19,11 @@ def handle_command(command):
     # ---- MODEL COMMANDS ----
 
     if cmd == "/models":
-        from core.model_manager import show_models
-        show_models(argument)
+        if getattr(config, "provider_mode", "cloud") == "offline":
+            console.print("[yellow]Cloud model discovery is disabled in OFFLINE mode. Use /pick for installed Ollama models.[/yellow]")
+        else:
+            from core.model_manager import show_models
+            show_models(argument)
 
     elif cmd == "/use":
         from core.model_manager import select_model
@@ -35,10 +38,13 @@ def handle_command(command):
         show_usage(argument)
 
     elif cmd == "/refresh":
-        from api.omniroute import fetch_models
-        from ui.console import show_model_info
-        fetch_models(show_message=True)
-        show_model_info()
+        if getattr(config, "provider_mode", "cloud") == "offline":
+            console.print("[yellow]OmniRoute refresh is disabled in OFFLINE mode. Use /online to switch to cloud mode first.[/yellow]")
+        else:
+            from api.omniroute import fetch_models
+            from ui.console import show_model_info
+            fetch_models(show_message=True)
+            show_model_info()
 
     elif cmd == "/auto":
         config.current_model = "auto"
@@ -176,6 +182,44 @@ def handle_command(command):
     elif cmd == "/pick":
         from ui.picker import run_picker
         run_picker(argument)
+
+    elif cmd in ("/local", "/offline"):
+        from api.ollama import fetch_models
+        config.provider_mode = "offline" if cmd == "/offline" else "local"
+        config.model_selection_mode = "manual"
+        local_models = fetch_models(show_message=True)
+        if not local_models:
+            save_config()
+            console.print(
+                "[yellow]No local Ollama models found. Pull one with: ollama pull qwen3:4b[/yellow]\\n"
+                "[dim]Local-only mode is active; AIZEN will not fall back to cloud.[/dim]"
+            )
+        else:
+            current = config.current_model
+            installed = {m.get("id") for m in local_models}
+            if current not in installed:
+                config.current_model = local_models[0]["id"]
+            save_config()
+            mode_label = "OFFLINE" if cmd == "/offline" else "LOCAL"
+            console.print(
+                f"[bold green]✓ {mode_label} mode enabled.[/bold green] "
+                f"[cyan]{config.current_model}[/cyan]\\n"
+                "[dim]Cloud providers and cloud fallback are disabled in this mode.[/dim]"
+            )
+            from ui.console import show_model_info
+            show_model_info(selected_message=True)
+
+    elif cmd in ("/cloud", "/online"):
+        config.provider_mode = "cloud"
+        if str(config.current_model).startswith("ollama:"):
+            config.current_model = "auto"
+            config.model_selection_mode = "router"
+        save_config()
+        console.print("[bold green]✓ CLOUD mode enabled.[/bold green] [dim]Only verified-free cloud models are eligible.[/dim]")
+        from api.omniroute import fetch_models
+        fetch_models(show_message=True)
+        from ui.console import show_model_info
+        show_model_info(selected_message=True)
 
     # ---- PROVIDER HEALTH ----
 

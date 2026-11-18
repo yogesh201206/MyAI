@@ -150,6 +150,71 @@ def _passive_failure(
         pass  # Health recording must never crash the app
 
 
+class OmniRouteAPIError(RuntimeError):
+    """
+    Subclass of RuntimeError raised on non-200 HTTP responses.
+    Exposes status_code, retry_after, response_headers, and parsed details
+    while remaining backward-compatible with any code catching RuntimeError.
+    """
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+        response_headers: dict | None = None,
+        raw_body: str = "",
+        detected_tpm_limit: int | None = None,
+        requested_tokens: int | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.response_headers = response_headers or {}
+        self.raw_body = raw_body
+        self.detected_tpm_limit = detected_tpm_limit
+        self.requested_tokens = requested_tokens
+
+
+def _handle_http_error(response, model: str, response_time: float) -> OmniRouteAPIError:
+    """Helper to process and construct OmniRouteAPIError from failed HTTP response."""
+    status_code = response.status_code
+    text = response.text
+    headers = dict(response.headers) if hasattr(response, "headers") else {}
+
+    try:
+        from core.context_budget import (
+            parse_api_error,
+            record_detected_tpm_limit,
+            set_model_cooldown,
+        )
+        details = parse_api_error(status_code, text, headers)
+        if details.detected_tpm_limit:
+            record_detected_tpm_limit(model, details.detected_tpm_limit)
+        if details.retry_after and details.retry_after > 0:
+            set_model_cooldown(model, details.retry_after)
+
+        diag = {
+            "retry_after": details.retry_after,
+            "detected_tpm": details.detected_tpm_limit,
+            "requested_tokens": details.requested_tokens,
+            "status_code": status_code,
+        }
+        _passive_failure(model, status_code, text, response_time, diagnostics=diag)
+
+        return OmniRouteAPIError(
+            details.error_message or text,
+            status_code=status_code,
+            retry_after=details.retry_after,
+            response_headers=headers,
+            raw_body=text,
+            detected_tpm_limit=details.detected_tpm_limit,
+            requested_tokens=details.requested_tokens,
+        )
+    except Exception:
+        _passive_failure(model, status_code, text, response_time)
+        return OmniRouteAPIError(text, status_code=status_code, raw_body=text)
+
+
 # ------------------------------------------------------------------
 # CHAT COMPLETION
 # ------------------------------------------------------------------
@@ -172,7 +237,7 @@ def send_chat(messages, model):
         requests.exceptions.Timeout      — on timeout
         requests.exceptions.ConnectionError — if OmniRoute is unreachable
         KeyboardInterrupt                  — propagated from signal
-        RuntimeError                       — if API returns non-200
+        OmniRouteAPIError / RuntimeError    — if API returns non-200
     """
     payload = {
         "model": model,
@@ -197,8 +262,7 @@ def send_chat(messages, model):
     response_time = time.time() - start_time
 
     if response.status_code != 200:
-        _passive_failure(model, response.status_code, response.text, response_time)
-        raise RuntimeError(response.text)
+        raise _handle_http_error(response, model, response_time)
 
     result = response.json()
 
@@ -240,7 +304,7 @@ def stream_chat(messages, model):
         requests.exceptions.Timeout
         requests.exceptions.ConnectionError
         KeyboardInterrupt
-        RuntimeError
+        OmniRouteAPIError / RuntimeError
     """
     payload = {
         "model": model,
@@ -264,8 +328,7 @@ def stream_chat(messages, model):
         stream=True
     ) as response:
         if response.status_code != 200:
-            _passive_failure(model, response.status_code, response.text, time.time() - start_time)
-            raise RuntimeError(response.text)
+            raise _handle_http_error(response, model, time.time() - start_time)
 
         actual_model = model
         usage = None

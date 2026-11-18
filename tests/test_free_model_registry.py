@@ -48,10 +48,39 @@ from core.free_model_registry import (
 
 
 class TestFreeModelRegistryPhase13(unittest.TestCase):
+    # ── Canonical test models that must behave as VERIFIED FREE ──────────────
+    # Production _INITIAL_REGISTRY_RECORDS use verified_at dates from Oct 2026,
+    # which are intentionally left as-is (they are genuinely stale as of Nov 2026
+    # because no new evidence was gathered). Tests that need a known-fresh
+    # verified-free model re-register these using today's date as a controlled
+    # test fixture, exercising the "model IS verified free" code path
+    # independently of when the production records were last reviewed.
+    _TEST_FREE_MODELS = [
+        ("groq",     "groq/openai/gpt-oss-120b",                          "GPT-OSS 120B"),
+        ("groq",     "groq/openai/gpt-oss-20b",                           "GPT-OSS 20B"),
+        ("aihorde",  "aihorde/aphrodite/TheDrummer/Cydonia-24B-v4.3",     "Cydonia 24B (AI Horde)"),
+        ("aihorde",  "aihorde/aphrodite/TheDrummer/Skyfall-31B-v4.2",     "Skyfall 31B (AI Horde)"),
+        ("aihorde",  "aihorde/google/gemma-4-31b",                        "Gemma 4 31B (AI Horde)"),
+    ]
+
     def setUp(self):
         # Reset global registry to standard defaults before each test
-        get_free_registry().reset_defaults()
+        reg = get_free_registry()
+        reg.reset_defaults()
         config.free_verification_days = 30
+
+        # Re-register core free models with today's date as a controlled
+        # test fixture so tests that exercise the "verified-free" code path
+        # always see a fresh record. Production verified_at dates remain
+        # unchanged (Oct 2026, now stale); this only affects the in-memory
+        # registry for the duration of the current test.
+        _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for _prov, _mid, _disp in self._TEST_FREE_MODELS:
+            reg.verify_model(
+                provider=_prov, model=_mid, display_name=_disp,
+                source="Test fixture — controlled fresh date for test isolation",
+                verified_at=_today, save=False,
+            )
 
     # ══════════════════════════════════════════════════════════
     # Test 1 — Verified Free

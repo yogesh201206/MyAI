@@ -61,6 +61,7 @@ def setup_storage():
             {
                 "current_chat_id": None,
                 "current_model": config.DEFAULT_MODEL,
+                "provider_mode": config.DEFAULT_PROVIDER_MODE,
                 "streaming_enabled": config.DEFAULT_STREAMING,
                 "voice_enabled": config.DEFAULT_VOICE_ENABLED,
                 "voice_input_enabled": config.DEFAULT_VOICE_INPUT_ENABLED,
@@ -121,6 +122,7 @@ def _apply_config_defaults():
     """Reset all config state to defaults (used as fallback on load failure)."""
     config.current_chat_id = None
     config.current_model = config.DEFAULT_MODEL
+    config.provider_mode = config.DEFAULT_PROVIDER_MODE
     config.streaming_enabled = config.DEFAULT_STREAMING
     config.rag_enabled = config.DEFAULT_RAG_ENABLED
     config.project_mode = config.DEFAULT_PROJECT_MODE
@@ -149,12 +151,18 @@ def _apply_config_defaults():
     config.voice_input_device = None
     config.voice_output_device = None
     config.free_verification_days = config.DEFAULT_FREE_VERIFICATION_DAYS
+    config.model_context_budgets = {}
+    config.model_tpm_limits = {}
+    config.context_budget_safety_factor = config.DEFAULT_CONTEXT_BUDGET_SAFETY_FACTOR
+    config.max_retry_after_wait = config.DEFAULT_MAX_RETRY_AFTER_WAIT
 
 
 def _apply_config_dict(data: dict) -> None:
     """Apply a loaded config dict to the config module, with backward-compat defaults."""
     config.current_chat_id = data.get("current_chat_id")
     config.current_model = data.get("current_model", config.DEFAULT_MODEL)
+    default_provider_mode = "local" if str(config.current_model).startswith("ollama:") else config.DEFAULT_PROVIDER_MODE
+    config.provider_mode = data.get("provider_mode", default_provider_mode)
     config.streaming_enabled = data.get("streaming_enabled", config.DEFAULT_STREAMING)
     config.rag_enabled = data.get("rag_enabled", config.DEFAULT_RAG_ENABLED)
     config.project_mode = data.get("project_mode", config.DEFAULT_PROJECT_MODE)
@@ -185,6 +193,12 @@ def _apply_config_dict(data: dict) -> None:
     config.voice_input_device = data.get("voice_input_device", None)
     config.voice_output_device = data.get("voice_output_device", None)
     config.free_verification_days = int(data.get("free_verification_days", config.DEFAULT_FREE_VERIFICATION_DAYS))
+
+    # Context Budgeting & TPM Protection
+    config.model_context_budgets = data.get("model_context_budgets", {})
+    config.model_tpm_limits = data.get("model_tpm_limits", {})
+    config.context_budget_safety_factor = float(data.get("context_budget_safety_factor", config.DEFAULT_CONTEXT_BUDGET_SAFETY_FACTOR))
+    config.max_retry_after_wait = float(data.get("max_retry_after_wait", config.DEFAULT_MAX_RETRY_AFTER_WAIT))
 
 
 def load_config():
@@ -229,6 +243,7 @@ def save_config():
         {
             "current_chat_id": config.current_chat_id,
             "current_model": config.current_model,
+            "provider_mode": getattr(config, "provider_mode", config.DEFAULT_PROVIDER_MODE),
             "streaming_enabled": config.streaming_enabled,
             "rag_enabled": config.rag_enabled,
             "project_mode": config.project_mode,
@@ -257,6 +272,10 @@ def save_config():
             "voice_input_device": config.voice_input_device,
             "voice_output_device": config.voice_output_device,
             "free_verification_days": config.free_verification_days,
+            "model_context_budgets": getattr(config, "model_context_budgets", {}),
+            "model_tpm_limits": getattr(config, "model_tpm_limits", {}),
+            "context_budget_safety_factor": getattr(config, "context_budget_safety_factor", config.DEFAULT_CONTEXT_BUDGET_SAFETY_FACTOR),
+            "max_retry_after_wait": getattr(config, "max_retry_after_wait", config.DEFAULT_MAX_RETRY_AFTER_WAIT),
         }
     )
 
@@ -278,6 +297,14 @@ def validate_and_sanitize_configured_model() -> tuple[bool, str | None]:
 
     model = getattr(config, "current_model", None)
     if not model or model == "auto":
+        return True, None
+
+    # Local Ollama models are separate from the cloud free-model registry.
+    # Preserve the selection if Ollama is temporarily offline.
+    if str(model).startswith("ollama:"):
+        if getattr(config, "provider_mode", "cloud") == "cloud":
+            config.provider_mode = "local"
+            save_config()
         return True, None
 
     provider = None

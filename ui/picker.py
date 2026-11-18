@@ -183,8 +183,8 @@ class ModelPicker:
         shown = len(self.filtered)
         total = len(self.all_models)
         return FormattedText([
-            ("class:header", "  ⚡  AIZEN Free Model Picker  "),
-            ("class:count",  f"  {shown} / {total} free models  "),
+            ("class:header", "  ⚡  AIZEN Hybrid Model Picker  "),
+            ("class:count",  f"  {shown} / {total} models  "),
         ])
 
     def _render_col_header(self):
@@ -200,7 +200,7 @@ class ModelPicker:
 
         if not self.filtered:
             lines.append(("class:no-match",
-                          "  No verified-free models match your filter. "
+                          "  No local or verified-free cloud models match your filter. "
                           "Keep typing or clear to see all.\n"))
             return FormattedText(lines)
 
@@ -216,14 +216,17 @@ class ModelPicker:
             caps_str = _caps(model)
 
             # Health indicator (best-effort; defaults to neutral on any error)
-            try:
-                from core.provider_health import (
-                    get_provider_for_model, get_health_indicator,
-                )
-                prov = get_provider_for_model(mid) or model.get("owned_by", "")
-                health_str = get_health_indicator(prov) if prov else "· UNKNOWN"
-            except Exception:
-                health_str = "· UNKNOWN"
+            if model.get("source") == "ollama" or mid.startswith("ollama:"):
+                health_str = "● LOCAL"
+            else:
+                try:
+                    from core.provider_health import (
+                        get_provider_for_model, get_health_indicator,
+                    )
+                    prov = get_provider_for_model(mid) or model.get("owned_by", "")
+                    health_str = get_health_indicator(prov) if prov else "· UNKNOWN"
+                except Exception:
+                    health_str = "· UNKNOWN"
 
             is_sel = abs_i == self.sel_idx
             is_cur = mid   == config.current_model
@@ -251,7 +254,8 @@ class ModelPicker:
             lines.append((row_cls, mark))
             lines.append((row_cls, f"{mid:<36}"))
             lines.append(("class:provider", f" {provider:<12}"))
-            lines.append(("class:search-label", f" {'FREE VERIFIED':<16}"))
+            policy = "LOCAL" if (model.get("source") == "ollama" or mid.startswith("ollama:")) else "FREE VERIFIED"
+            lines.append(("class:search-label", f" {policy:<16}"))
             lines.append(("class:provider", f" {health_str:<12}"))
             lines.append(("class:ctx",
                           f"  {ctx:>6}/{max_in:>6}/{max_out:>6}"))
@@ -407,78 +411,83 @@ class ModelPicker:
 
 def run_picker(filter_text=""):
     """
-    High-level entry point:  fetch models → open picker → apply selection.
-
-    Called from commands/handlers.py (/pick) and ui/prompts.py (Alt+M).
-    Returns the selected model id or None if cancelled / OmniRoute offline.
+    Load installed Ollama models and verified-free cloud models into one picker.
+    Local entries are independently validated against Ollama's installed catalog.
     """
-    from api.omniroute import fetch_models
+    from api.omniroute import fetch_models as fetch_cloud_models
+    from api.ollama import fetch_models as fetch_local_models
     from core.free_model_registry import is_model_allowed
     from core.provider_health import get_provider_for_model
     from core.storage import save_config
     from ui.console import console, show_model_info
 
-    # Ensure catalog is fresh; refresh from OmniRoute if needed
-    if not config.model_catalog:
-        if not fetch_models(show_message=False) or not config.model_catalog:
-            console.print(
-                "[yellow]No verified free models available.[/yellow]\n"
-                "[dim]Paid and unverified models are blocked by AIZEN Free-Only mode.[/dim]"
-            )
-            return None
-    else:
-        # Silently attempt to refresh live catalog without blocking if offline
-        fetch_models(show_message=False)
+    # Strict offline mode must not make any cloud request.
+    offline = getattr(config, "provider_mode", "cloud") == "offline"
+    if not offline:
+        fetch_cloud_models(show_message=False)
+    local_models = fetch_local_models(show_message=False)
+    cloud_models = [] if offline else list(config.model_catalog or [])
+    combined = cloud_models + local_models
 
-    if not config.model_catalog:
+    if not combined:
         console.print(
-            "[yellow]No verified free models available.[/yellow]\n"
-            "[dim]Paid and unverified models are blocked by AIZEN Free-Only mode.[/dim]"
+            "[yellow]No models are currently available.[/yellow]\\n"
+            "[dim]Start Ollama and/or OmniRoute, then run /pick again.[/dim]"
         )
         return None
 
-    # If a filter was given, check for matches; return to prompt if none
     effective_filter = (filter_text or "").strip()
     if effective_filter:
         q = effective_filter.lower()
         matched = [
-            m for m in config.model_catalog
-            if q in (
-                m.get("id", "") + " " + str(m.get("owned_by", ""))
-            ).lower()
+            m for m in combined
+            if q in (m.get("id", "") + " " + str(m.get("owned_by", ""))).lower()
         ]
         if not matched:
-            console.print(
-                f"[yellow]No verified free models available for this provider ('{effective_filter}').[/yellow]"
-            )
+            console.print(f"[yellow]No local or verified-free cloud models match '{effective_filter}'.[/yellow]")
             return None
 
-    # Launch the interactive picker
-    picker = ModelPicker(config.model_catalog, initial_filter=effective_filter)
+    picker = ModelPicker(combined, initial_filter=effective_filter)
     selected_id = picker.run()
-
     if selected_id is None:
         console.print("[dim]Picker cancelled — model unchanged.[/dim]")
         return None
 
-    # Validate against central Free-Only registry
+    # Local models are only selectable when currently installed in Ollama.
+    if selected_id.startswith("ollama:"):
+        installed = {m.get("id") for m in fetch_local_models(show_message=False)}
+        if selected_id not in installed:
+            console.print("[bold red]That Ollama model is no longer installed.[/bold red]")
+            return None
+        config.current_model = selected_id
+        if not offline:
+            config.provider_mode = "local"
+        config.model_selection_mode = "manual"
+        save_config()
+        console.print(
+            f"\\n[bold green]✓ Local model selected:[/bold green] "
+            f"[cyan]{selected_id}[/cyan] [green](LOCAL)[/green]\\n"
+            "[dim]Requests will stay on this machine; no cloud fallback.[/dim]\\n"
+        )
+        show_model_info(selected_message=True)
+        return selected_id
+
     prov = get_provider_for_model(selected_id)
     if not is_model_allowed(prov, selected_id):
         console.print(
-            "\n[bold red]❌ Model is not available in AIZEN Free-Only mode.[/bold red]\n"
-            "[dim]Only verified free models can be selected.[/dim]\n"
+            "\\n[bold red]❌ Model is not available in AIZEN Free-Only mode.[/bold red]\\n"
+            "[dim]Only verified-free cloud models or installed local Ollama models can be selected.[/dim]\\n"
         )
         return None
 
-    # Persist and confirm
     config.current_model = selected_id
+    config.provider_mode = "cloud"
     config.model_selection_mode = "manual"
     save_config()
-
     console.print(
-        f"\n[bold green]✓ Model selected:[/bold green] "
-        f"[cyan]{selected_id}[/cyan] [green](FREE VERIFIED)[/green]\n"
-        "[dim]Manual model override enabled.[/dim]\n"
+        f"\\n[bold green]✓ Model selected:[/bold green] "
+        f"[cyan]{selected_id}[/cyan] [green](FREE VERIFIED)[/green]\\n"
+        "[dim]Manual cloud model override enabled.[/dim]\\n"
     )
     show_model_info(selected_message=True)
     return selected_id

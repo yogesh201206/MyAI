@@ -19,6 +19,19 @@ AIZEN_VERSION = "1.0.0"
 
 API_BASE = "http://localhost:20128/v1"
 
+# Native local Ollama endpoint. Local model IDs are namespaced as ollama:<name>.
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+OLLAMA_TIMEOUT = 8
+OLLAMA_REQUEST_TIMEOUT = 300
+OLLAMA_DEFAULT_CONTEXT = 8192
+OLLAMA_NUM_CTX = 8192
+# Output tokens reserved for Ollama completions (subtracted from context window
+# to get the maximum safe *input* token budget for local models).
+OLLAMA_NUM_PREDICT = 2048
+# Maximum input tokens for local Ollama requests:
+# OLLAMA_NUM_CTX - OLLAMA_NUM_PREDICT with an additional 5% safety margin.
+OLLAMA_MAX_INPUT_TOKENS = int((OLLAMA_NUM_CTX - OLLAMA_NUM_PREDICT) * 0.95)  # 5,832
+
 CHAT_URL = f"{API_BASE}/chat/completions"
 MODELS_URL = f"{API_BASE}/models"
 
@@ -48,6 +61,7 @@ FREE_REGISTRY_FILE = os.path.join(DATA_DIR, "free_model_registry.json")
 # ------------------------------------------------------------------
 
 DEFAULT_MODEL = "auto"
+DEFAULT_PROVIDER_MODE = "cloud"  # cloud | local | offline
 DEFAULT_STREAMING = True
 DEFAULT_RAG_ENABLED = True
 DEFAULT_RAG_TOP_K = 5
@@ -117,6 +131,17 @@ When code is requested:
 Be clear and useful.
 """
 
+# Compact system prompt for local Ollama models.
+# Omits cloud-routing instructions, global skill files, and tool descriptions
+# that are irrelevant to local inference and would waste the limited context window.
+LOCAL_SYSTEM_PROMPT = """You are AIZEN AI, a local assistant running on Ollama.
+
+Help with programming (Java, Python, JS, React, Spring Boot), databases, cybersecurity, algorithms, and general questions.
+
+When writing code: be clean, readable, and explain simply. Prefer Java or Python unless another language is requested.
+
+Maintain conversation context. Be clear and concise."""
+
 # ------------------------------------------------------------------
 # UI COPY
 # ------------------------------------------------------------------
@@ -154,6 +179,9 @@ streaming_enabled = DEFAULT_STREAMING
 
 model_catalog = []
 model_map = {}
+local_model_catalog = []
+local_model_map = {}
+provider_mode = DEFAULT_PROVIDER_MODE
 raw_model_catalog = []
 raw_model_map = {}
 
@@ -207,6 +235,14 @@ debug_mode = DEFAULT_DEBUG_MODE
 
 # -- Phase 13: Free model registry state --
 free_verification_days = DEFAULT_FREE_VERIFICATION_DAYS
+
+# -- Context Budgeting & TPM Protection State --
+DEFAULT_CONTEXT_BUDGET_SAFETY_FACTOR = 0.80
+DEFAULT_MAX_RETRY_AFTER_WAIT = 5.0
+model_context_budgets = {}
+model_tpm_limits = {}
+context_budget_safety_factor = DEFAULT_CONTEXT_BUDGET_SAFETY_FACTOR
+max_retry_after_wait = DEFAULT_MAX_RETRY_AFTER_WAIT
 
 
 # -- Phase 13: Voice mode runtime state --

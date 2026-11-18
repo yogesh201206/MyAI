@@ -173,6 +173,36 @@ def route(prompt: str, context_details: Optional[dict] = None) -> RoutingDecisio
     # Phase 14: use ranker_task for scoring dimensions
     ranker_task = getattr(classification, "ranker_task", task_type)
 
+    # Explicit local/offline mode: route only to installed Ollama models.
+    # This branch never consults the cloud registry or cloud retry candidates.
+    provider_mode = getattr(config, "provider_mode", "cloud")
+    if provider_mode in {"local", "offline"}:
+        from api.ollama import fetch_models
+        local_models = fetch_models(show_message=False)
+        local_ids = {item.get("id") for item in local_models}
+        selected = config.current_model
+        if selected not in local_ids:
+            selected = local_models[0]["id"] if local_models else ""
+            if selected:
+                config.current_model = selected
+        decision = RoutingDecision(
+            task_type=task_type,
+            selected_model=selected,
+            provider="Ollama (Local)" if selected else "Ollama (Local)",
+            reason="Explicit local-only mode — cloud providers are disabled.",
+            confidence=1.0 if selected else 0.0,
+            candidate_count=1 if selected else 0,
+            free_candidate_count=0,
+            factors={"total": 100.0 if selected else 0.0},
+            evaluated_candidates=[{"model": selected, "score": 100.0, "provider": "Ollama (Local)"}] if selected else [],
+            rejected_candidates=[],
+            is_manual_override=True,
+            fallback_used=False,
+            router_enabled=router_on,
+        )
+        _record_decision(decision)
+        return decision
+
     # 2. Manual model selection override
     is_manual = (getattr(config, "model_selection_mode", "ROUTER").lower() == "manual")
     if is_manual or not router_on:
@@ -287,20 +317,26 @@ def get_retry_model(
     failed_model: str,
     failed_provider: Optional[str] = None,
     attempt: int = 1,
+    estimated_context_tokens: int = 1500,
+    excluded_models: Optional[set] = None,
 ) -> Optional[str]:
     """
     Select a free fallback candidate if the router-selected model fails.
 
-    Phase 14 rules:
+    Phase 14 & TPM Protection rules:
       - Manual override: NEVER silently switch (return None)
       - Max retries limited by config.router_max_fallbacks
       - All fallback candidates MUST be verified free
       - Never falls back to paid/unknown/stale
+      - Fallback candidate MUST fit estimated_context_tokens within its budget
+      - Avoids all models previously attempted in excluded_models
 
     Args:
         failed_model: Model ID that failed.
         failed_provider: Provider of the failed model (used for soft penalty).
         attempt: Current retry attempt number (1-based).
+        estimated_context_tokens: Tokens required for this turn.
+        excluded_models: Set of all model IDs already tried for this turn.
 
     Returns:
         Alternative free model ID, or None if max retries exceeded or no candidate.
@@ -314,18 +350,18 @@ def get_retry_model(
 
     last = getattr(config, "last_routing_decision", None)
     task_type = getattr(last, "ranker_task", TASK_AUTO) if last else TASK_AUTO
-    if not task_type or task_type == last.task_type if last else True:
-        # Fall back to ranker_task from classification
+    if not task_type or (last and task_type == last.task_type):
         task_type = last.task_type if last else TASK_AUTO
 
-    est_context = 1500
-    excluded_models = {failed_model}
+    est_context = max(1500, estimated_context_tokens)
+    all_excluded_models = set(excluded_models or set())
+    all_excluded_models.add(failed_model)
     excluded_providers = {failed_provider} if failed_provider else set()
 
     scored, _ = rank_models(
         task_type=task_type,
         estimated_context_tokens=est_context,
-        excluded_models=excluded_models,
+        excluded_models=all_excluded_models,
         excluded_providers=excluded_providers,
     )
 

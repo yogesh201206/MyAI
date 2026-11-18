@@ -301,7 +301,7 @@ def show_model_info(model_id=None, selected_message=False):
         model_id = config.current_model
 
     meta = get_model_meta(model_id)
-    context = get_context_status()
+    context = get_context_status(model_id)
 
     table = Table(show_header=False, box=None)
     table.add_row("Selected Model", f"[cyan]{model_id}[/cyan]")
@@ -343,6 +343,11 @@ def show_model_info(model_id=None, selected_message=False):
         table.add_row("Max Input", "—")
         table.add_row("Max Output", "—")
         table.add_row("Capabilities", "none")
+
+    if context.get("tpm_limit"):
+        table.add_row("TPM Rate Limit", f"{human_number(context['tpm_limit'])} tokens/min")
+    if context.get("budget"):
+        table.add_row("Safe Context Budget", f"{human_number(context['budget'])} tokens")
 
     table.add_row("Current Chat Approx Usage", human_number(context["used"]))
 
